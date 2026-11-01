@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 .DS_Store
+autofix.yml.bak
+_old_autofix.yml.bak
