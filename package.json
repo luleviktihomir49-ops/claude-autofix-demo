@@ -1,0 +1,15 @@
+{
+  "name": "claude-autofix-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo: a headless Claude Code agent that reproduces a reported bug with a failing test, fixes it, and opens a pull request with proof — reviewed by a second, independent agent.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --reporter=verbose",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

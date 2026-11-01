@@ -1,0 +1,195 @@
+# Headless Claude Code pipeline:
+#   1) "fix" agent: reproduces the reported bug with a NEW failing test, fixes it, opens a PR with before/after proof.
+#   2) "review" agent: a separate run with no memory of the first one, checks the PR and posts an independent review.
+#
+# Triggers:
+#   - an issue gets the label "autofix"   (only people with triage/write access can add labels)
+#   - manual: Actions → Autofix → Run workflow → paste a bug description
+#
+# Secrets needed (one of):
+#   ANTHROPIC_API_KEY          – Anthropic Console API key
+#   CLAUDE_CODE_OAUTH_TOKEN    – from `claude setup-token` (Claude Pro/Max subscription)
+# Repo setting needed: Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests".
+
+name: Autofix
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Bug report (what happens, what you expected, how to reproduce)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+concurrency:
+  group: autofix-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'autofix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      branch: ${{ steps.meta.outputs.branch }}
+      issue: ${{ steps.meta.outputs.issue }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Work out branch name and bug text
+        id: meta
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          TASK: ${{ github.event.inputs.task }}
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "branch=autofix/issue-${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "issue=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+            {
+              echo "bug<<EOF"
+              echo "Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
+              echo ""
+              echo "${ISSUE_BODY}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "branch=autofix/run-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            echo "issue=" >> "$GITHUB_OUTPUT"
+            {
+              echo "bug<<EOF"
+              echo "${TASK}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git identity for the agent
+        run: |
+          git config user.name "claude-autofix[bot]"
+          git config user.email "claude-autofix@users.noreply.github.com"
+
+      - name: Run the fix agent (headless Claude Code)
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: ${{ github.event_name == 'issues' }}
+          prompt: |
+            You are the autofix agent for this repository. Work alone, without asking questions.
+
+            BUG REPORT
+            ${{ steps.meta.outputs.bug }}
+
+            BRANCH TO USE: ${{ steps.meta.outputs.branch }}
+            ISSUE NUMBER (may be empty): ${{ steps.meta.outputs.issue }}
+
+            DO THIS, IN ORDER
+            1. Reproduce. Read the relevant code in src/ and the existing tests in tests/. Write a NEW test in tests/
+               that captures exactly the reported behaviour and expected result. Run `npm test` and confirm the new
+               test FAILS and all old tests still pass. Save the full output to /tmp/before.txt (e.g. `npm test > /tmp/before.txt 2>&1 || true`).
+            2. Fix. Make the smallest correct change in src/ that addresses the ROOT CAUSE. Do not weaken, skip or
+               delete any existing test. Do not add dependencies. Do not touch .github/, package.json or tsconfig.json.
+            3. Verify. Run `npm run typecheck` and `npm test`; everything must pass. Save the output to /tmp/after.txt.
+            4. Ship. `git checkout -b <BRANCH>`; commit in two steps — first the test ("test: reproduce <bug>"), then the
+               fix ("fix: <root cause>"). `git push -u origin <BRANCH>`. Open a pull request against main with
+               `gh pr create` using this body (fill every section, keep it factual):
+
+               ## Summary
+               <one paragraph: what was wrong, what changed>
+               ## Root cause
+               <file:line and why>
+               ## Proof
+               ### Before (new test failing)
+               ```
+               <relevant lines from /tmp/before.txt>
+               ```
+               ### After (all tests passing)
+               ```
+               <relevant lines from /tmp/after.txt>
+               ```
+               ## Risk
+               <what else could be affected; why this is safe>
+
+               If ISSUE NUMBER is not empty, end the body with "Closes #<ISSUE NUMBER>".
+            5. If you cannot reproduce the bug after a genuine attempt, do NOT change src/. Instead, if ISSUE NUMBER is
+               not empty, comment on the issue with `gh issue comment` explaining exactly what you tried and what you
+               observed, then stop.
+
+            RULES
+            - Never claim a test failed or passed without having run it in this session.
+            - Keep changes minimal and readable; match the existing code style.
+            - Everything you did must be visible in the PR body or the issue comment.
+          claude_args: |
+            --max-turns 40
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm test),Bash(npm test *),Bash(npm run typecheck),Bash(npx vitest *),Bash(node *),Bash(cat *),Bash(mkdir *),Bash(git *),Bash(gh pr create *),Bash(gh pr view *),Bash(gh pr list *),Bash(gh issue comment *)"
+
+  review:
+    needs: fix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run the independent review agent (separate context, no memory of the fix run)
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are an independent reviewer. Another agent may have opened a pull request from branch
+            "${{ needs.fix.outputs.branch }}". You have NOT seen its reasoning — judge only the code.
+
+            1. `gh pr list --head "${{ needs.fix.outputs.branch }}" --state open --json number,title,url` — if there is no
+               PR, print "No PR to review" and stop.
+            2. `git fetch origin "${{ needs.fix.outputs.branch }}"` and `git checkout "${{ needs.fix.outputs.branch }}"`.
+               Run `npm ci && npm test`. Note the result.
+            3. Does the new test really catch the bug? Temporarily revert ONLY the src/ change
+               (`git stash` is not available across commits — instead: `git diff origin/main...HEAD -- src > /tmp/fix.patch`,
+               `git apply -R /tmp/fix.patch`, run `npm test`, then `git apply /tmp/fix.patch` to restore). The new test must
+               FAIL without the fix and PASS with it. Record both outputs.
+            4. Read the diff (`git diff origin/main...HEAD`). Check: root cause vs symptom patch; existing tests untouched;
+               no unrelated changes; no new dependencies; files outside src/ and tests/ untouched.
+            5. Post ONE comment on the PR with `gh pr comment <number> --body-file /tmp/review.md` using this template:
+
+               ## Independent review (second agent)
+               **Verdict:** APPROVE / REQUEST CHANGES
+               **Test actually catches the bug:** yes/no — <evidence: failing output without fix, passing with fix>
+               **Root cause addressed:** yes/no — <why>
+               **Scope:** <files changed; anything outside src/ or tests/?>
+               **Concerns:** <bullets or "none">
+
+            Do not modify any files on the branch. Do not approve or merge anything yourself.
+          claude_args: |
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Write(/tmp/*),Bash(npm ci),Bash(npm test),Bash(npm test *),Bash(npx vitest *),Bash(git *),Bash(cat *),Bash(gh pr list *),Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr comment *)"
